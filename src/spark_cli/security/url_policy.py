@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ipaddress
+import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
@@ -44,47 +45,22 @@ def _host_ip(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
         return None
 
 
-def _resolve_redirects(url: str, max_redirects: int = 5) -> str:
-    """
-    Follow HTTP redirects and return the final destination URL.
-    Prevents SSRF via redirect chains to localhost/metadata services.
-    """
-    current_url = url
-    for _ in range(max_redirects):
-        try:
-            req = urllib.request.Request(current_url, method='HEAD')
-            req.add_header('User-Agent', 'Spark-CLI-Security-Check/1.0')
-            with urllib.request.urlopen(req, timeout=3) as response:
-                # Check for redirect
-                if response.status in (301, 302, 303, 307, 308):
-                    location = response.headers.get('Location')
-                    if location:
-                        current_url = urllib.parse.urljoin(current_url, location)
-                        continue
-                # No redirect, return current URL
-                return current_url
-        except Exception:
-            # If we can't resolve, return the current URL for validation
-            return current_url
-    # Max redirects reached
-    return current_url
-
-
 def validate_url_safety(raw_url: str, *, label: str = "URL", policy: UrlPolicy | None = None) -> list[str]:
+    """Static, network-free policy check on a single URL string.
+
+    Used at config-validation time (e.g. ``spark doctor``) to flag obviously
+    unsafe endpoint values before any request is ever made. Performs *no* I/O,
+    so it cannot itself become an SSRF surface.
+
+    Runtime defenders that follow redirects must use :func:`safe_urlopen`, which
+    re-applies this policy at every hop.
+    """
     active_policy = policy or UrlPolicy()
     value = str(raw_url or "").strip()
     if not value or value.startswith("${"):
         return []
 
     errors: list[str] = []
-    
-    # Follow redirects and validate final destination
-    final_url = _resolve_redirects(value)
-    if final_url != value:
-        # Note: We validate the final URL but don't add this as an error
-        # Just use the final destination for validation
-        value = final_url
-    
     parsed = _parse_url(value)
     if parsed.scheme not in {"http", "https"}:
         return [f"{label} uses unsupported URL scheme `{parsed.scheme}`."]
@@ -109,3 +85,79 @@ def validate_url_safety(raw_url: str, *, label: str = "URL", policy: UrlPolicy |
     if active_policy.require_https_for_remote and not is_local and parsed.scheme != "https":
         errors.append(f"{label} uses non-HTTPS remote endpoint `{value}`.")
     return errors
+
+
+class _PolicyEnforcingRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Reject redirect hops that fail the configured :class:`UrlPolicy`.
+
+    The default ``HTTPRedirectHandler`` blindly follows every ``Location:`` it
+    is handed, which is exactly the SSRF primitive we need to close: an
+    attacker-controlled origin replies ``302 -> http://169.254.169.254/...`` or
+    ``-> http://127.0.0.1:11434/...`` and the validator sees a benign first-hop
+    URL while the runtime fetcher silently lands on a cloud metadata or local
+    admin endpoint.
+
+    This subclass re-runs :func:`validate_url_safety` on every redirect target
+    *before* delegating to the base implementation, so any policy violation
+    short-circuits the chain with a clean ``URLError`` instead of completing
+    the unsafe fetch.
+    """
+
+    def __init__(self, *, label: str, policy: UrlPolicy):
+        super().__init__()
+        self._label = label
+        self._policy = policy
+
+    def redirect_request(  # type: ignore[override]
+        self,
+        req: urllib.request.Request,
+        fp,
+        code: int,
+        msg: str,
+        headers,
+        newurl: str,
+    ):
+        errors = validate_url_safety(newurl, label=self._label, policy=self._policy)
+        if errors:
+            raise urllib.error.URLError(
+                f"redirect blocked by URL policy: {errors[0]}"
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def safe_urlopen(
+    url_or_request: str | urllib.request.Request,
+    *,
+    label: str = "URL",
+    policy: UrlPolicy | None = None,
+    timeout: float | None = None,
+):
+    """Open a URL with redirect hops constrained by :class:`UrlPolicy`.
+
+    This is the runtime SSRF gate. The initial URL is validated up front, then
+    every ``3xx`` redirect target is re-validated by
+    :class:`_PolicyEnforcingRedirectHandler` before the next request is issued.
+
+    A redirect to a cloud metadata host, an unsafe bind host, or (depending on
+    policy) a private/local network raises :class:`urllib.error.URLError`
+    instead of being silently followed. Callers should catch ``URLError``
+    exactly like they would for a network failure.
+    """
+    active_policy = policy or UrlPolicy()
+    if isinstance(url_or_request, urllib.request.Request):
+        initial_url = url_or_request.full_url
+    else:
+        initial_url = url_or_request
+
+    initial_errors = validate_url_safety(initial_url, label=label, policy=active_policy)
+    if initial_errors:
+        raise urllib.error.URLError(
+            f"URL blocked by policy: {initial_errors[0]}"
+        )
+
+    opener = urllib.request.build_opener(
+        _PolicyEnforcingRedirectHandler(label=label, policy=active_policy)
+    )
+    if timeout is None:
+        return opener.open(url_or_request)
+    return opener.open(url_or_request, timeout=timeout)
