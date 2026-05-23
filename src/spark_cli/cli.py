@@ -476,6 +476,12 @@ def normalize_git_url(source: str) -> str:
     value = source.strip()
     if is_hosted_git_shorthand(value):
         return f"https://{value}"
+    # Defense-in-depth: reject URLs that look like git flags so they cannot be
+    # reinterpreted as command-line options on older git versions (< 2.30).
+    if value.startswith("-"):
+        raise SystemExit(
+            f"Invalid git URL: {value!r}. URLs cannot start with '-' (potential flag injection)."
+        )
     return value
 
 
@@ -655,7 +661,9 @@ def clone_module_source(
         verify_pinned_commit(name, target, pinned_commit, require_signed_commit=require_signed_commit)
         return target
     result = subprocess.run(
-        git_command("clone", "--depth=1", url, str(target)),
+        # Use '--' separator so an attacker-controlled URL cannot be
+        # reinterpreted as a git option even on older git versions.
+        git_command("clone", "--depth=1", "--", url, str(target)),
         capture_output=True,
         text=True,
     )
